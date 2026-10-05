@@ -28,5 +28,12 @@ python3 -m unittest -v
 - `POST /api/copies/{id}/simulate-corruption`：演示/测试介质损坏，仅 owner 或 archivist 可用。
 - `POST /api/versions/{id}/migrate`：生成格式迁移后的新版本并保留派生关系。
 - `GET /api/archives/{id}/status`：保留期限、版本状态和审计记录。
+- `POST /api/versions/{id}/destructions`：管理员发出销毁申请，三个存储点（服务端 + 各离线副本）一起进入待销毁，逐点执行；全部成功才写销毁记录，任一点失败则停在待处理。
+- `GET /api/destructions`：销毁单列表（可加 `?archive_id=` 过滤）。
+- `GET /api/destructions/{id}`：销毁账目页，逐点对账（记录状态 vs 存储实际是否已删除）。
+- `POST /api/destructions/{id}/reconcile`：恢复/对账，只重试仍处于待处理的未完成副本，已成功的存储点不重复执行。
+- `POST /api/storage/fault`：注入/解除存储点介质故障（`{"node_key":"copy:1","faulty":true}`），用于演示失败与恢复。
+
+销毁执行期间持有全局写锁，串行挡住同时上传；所有变更写入审计日志。
 
 档案路径拒绝绝对路径和 `..`；同一版本副本位置唯一；没有健康副本时版本标记为 `degraded`；所有变更写入审计日志。

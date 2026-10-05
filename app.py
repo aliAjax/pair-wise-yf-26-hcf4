@@ -61,6 +61,8 @@ class PreservationStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
         self._lock = threading.Lock()
+        # 销毁执行期间串行挡住上传（ingest/add_copy/migrate），避免与销毁流程并发写同一版本。
+        self._write_lock = threading.Lock()
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -95,7 +97,7 @@ class PreservationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     archive_id INTEGER NOT NULL REFERENCES archives(id),
                     version INTEGER NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'verified' CHECK(state IN ('verified','degraded')),
+                    state TEXT NOT NULL DEFAULT 'verified' CHECK(state IN ('verified','degraded','destroyed')),
                     created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL,
                     UNIQUE(archive_id,version)
@@ -113,7 +115,7 @@ class PreservationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL REFERENCES archive_versions(id),
                     location TEXT NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','degraded')),
+                    state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','degraded','destroyed')),
                     created_at TEXT NOT NULL,
                     last_verified_at TEXT,
                     UNIQUE(version_id,location)
@@ -143,6 +145,31 @@ class PreservationStore:
                     action TEXT NOT NULL,
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS destructions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    version_id INTEGER NOT NULL UNIQUE REFERENCES archive_versions(id),
+                    status TEXT NOT NULL DEFAULT 'in_progress' CHECK(status IN ('in_progress','completed','partial')),
+                    applicant_id TEXT NOT NULL REFERENCES users(id),
+                    applied_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS destruction_points(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    destruction_id INTEGER NOT NULL REFERENCES destructions(id),
+                    point_kind TEXT NOT NULL CHECK(point_kind IN ('server','copy')),
+                    copy_id INTEGER REFERENCES copies(id),
+                    location TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','destroyed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    executed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS storage_faults(
+                    node_key TEXT PRIMARY KEY,
+                    faulty INTEGER NOT NULL DEFAULT 0 CHECK(faulty IN (0,1)),
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -235,7 +262,7 @@ class PreservationStore:
 
     def ingest_version(self, actor_id: str, archive_id: int, files: object) -> dict:
         manifest = verify_manifest(files)
-        with self.connect() as conn:
+        with self._write_lock, self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             self._access(conn, archive_id, actor, require_write=True)
             try:
@@ -267,11 +294,13 @@ class PreservationStore:
         location = location.strip()
         if len(location) < 2:
             raise BusinessError("副本位置不能为空", 422, "invalid_location")
-        with self.connect() as conn:
+        with self._write_lock, self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
             if not version:
                 raise BusinessError("档案版本不存在", 404, "not_found")
+            if version["state"] == "destroyed":
+                raise BusinessError("该版本已销毁，不能新增副本", 409, "version_destroyed")
             self._access(conn, version["archive_id"], actor, require_write=True)
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -319,6 +348,8 @@ class PreservationStore:
                 if not copy:
                     raise BusinessError("副本不存在", 404, "not_found")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
+                if version and version["state"] == "destroyed":
+                    raise BusinessError("该版本已销毁", 409, "version_destroyed")
                 self._access(conn, version["archive_id"], user)
                 stored = conn.execute(
                     "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
@@ -384,11 +415,13 @@ class PreservationStore:
             return {"copy_id": copy_id, "path": path, "state": "corrupt"}
 
     def migrate(self, actor_id: str, version_id: int, source_path: str, target_path: str, target_format: str, content_b64: str) -> dict:
-        with self.connect() as conn:
+        with self._write_lock, self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             source_version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
             if not source_version:
                 raise BusinessError("源档案版本不存在", 404, "not_found")
+            if source_version["state"] == "destroyed":
+                raise BusinessError("该版本已销毁，不能迁移", 409, "version_destroyed")
             self._access(conn, source_version["archive_id"], actor, require_write=True)
             source = conn.execute(
                 "SELECT * FROM archive_files WHERE version_id=? AND path=?", (version_id, source_path)
@@ -447,6 +480,236 @@ class PreservationStore:
             }
 
 
+    def _can_access(self, conn, archive_id: int, user: sqlite3.Row) -> bool:
+        archive = conn.execute("SELECT owner_id FROM archives WHERE id=?", (archive_id,)).fetchone()
+        if not archive:
+            return False
+        if archive["owner_id"] == user["id"]:
+            return True
+        return conn.execute(
+            "SELECT 1 FROM archive_members WHERE archive_id=? AND user_id=?", (archive_id, user["id"])
+        ).fetchone() is not None
+
+    def request_destruction(self, actor_id: str, version_id: int) -> dict:
+        """管理员发出销毁申请：三个存储点（服务端 + 各离线副本）一起进入待销毁，再逐点执行。"""
+        with self._write_lock:
+            with self.connect() as conn:
+                actor = self._user(conn, actor_id, {"owner", "archivist"})
+                version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
+                if not version:
+                    raise BusinessError("档案版本不存在", 404, "not_found")
+                self._access(conn, version["archive_id"], actor, require_write=True)
+                if version["state"] == "destroyed":
+                    raise BusinessError("该版本已销毁", 409, "already_destroyed")
+                if conn.execute("SELECT 1 FROM destructions WHERE version_id=?", (version_id,)).fetchone():
+                    raise BusinessError("该版本已有销毁申请，请使用对账/恢复接口", 409, "destruction_exists")
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cur = conn.execute(
+                        "INSERT INTO destructions(archive_id,version_id,status,applicant_id,applied_at) VALUES(?,?,?,?,?)",
+                        (version["archive_id"], version_id, "in_progress", actor_id, now()),
+                    )
+                    destruction_id = cur.lastrowid
+                    # 服务端存储点
+                    conn.execute(
+                        "INSERT INTO destruction_points(destruction_id,point_kind,copy_id,location,state) VALUES(?,?,NULL,?,'pending')",
+                        (destruction_id, "server", "server"),
+                    )
+                    # 两个（或多个）离线副本存储点
+                    for c in conn.execute("SELECT id,location FROM copies WHERE version_id=? ORDER BY id", (version_id,)).fetchall():
+                        conn.execute(
+                            "INSERT INTO destruction_points(destruction_id,point_kind,copy_id,location,state) VALUES(?,?,?,?, 'pending')",
+                            (destruction_id, "copy", c["id"], c["location"]),
+                        )
+                    point_count = 1 + conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (version_id,)).fetchone()[0]
+                    self._audit(
+                        conn, version["archive_id"], actor_id, "destruction.request",
+                        {"destruction_id": destruction_id, "version_id": version_id, "points": point_count},
+                    )
+                except Exception:
+                    conn.rollback()
+                    raise
+            self._run_destruction_points(destruction_id)
+            with self.connect() as conn:
+                return self._destruction_detail(conn, conn.execute("SELECT * FROM destructions WHERE id=?", (destruction_id,)).fetchone())
+
+    def _node_key(self, point: sqlite3.Row) -> str:
+        return "server" if point["point_kind"] == "server" else f"copy:{point['copy_id']}"
+
+    def _execute_point(self, conn, point: sqlite3.Row) -> None:
+        """执行单个存储点的销毁；介质故障时抛出异常，由调用方回滚并标记待处理。"""
+        fault = conn.execute("SELECT faulty FROM storage_faults WHERE node_key=?", (self._node_key(point),)).fetchone()
+        if fault and fault["faulty"]:
+            raise RuntimeError(f"存储点 {point['location']} 介质故障，销毁未执行")
+        if point["point_kind"] == "server":
+            conn.execute("DELETE FROM archive_files WHERE version_id=?", (point["version_id"],))
+        else:
+            conn.execute("DELETE FROM copy_files WHERE copy_id=?", (point["copy_id"],))
+            conn.execute("UPDATE copies SET state='destroyed' WHERE id=?", (point["copy_id"],))
+
+    def _run_destruction_points(self, destruction_id: int) -> bool:
+        """逐点执行销毁：成功一点提交一点；失败则停在待处理，等恢复时只重试未完成的副本。"""
+        with self.connect() as conn:
+            d = conn.execute("SELECT * FROM destructions WHERE id=?", (destruction_id,)).fetchone()
+            if not d:
+                raise BusinessError("销毁单不存在", 404, "not_found")
+            points = conn.execute(
+                """SELECT dp.*, d.version_id FROM destruction_points dp
+                   JOIN destructions d ON d.id=dp.destruction_id
+                   WHERE dp.destruction_id=? ORDER BY dp.id""",
+                (destruction_id,),
+            ).fetchall()
+        all_destroyed = True
+        for point in points:
+            if point["state"] == "destroyed":
+                continue  # 幂等：已经成功的存储点不再重复执行
+            try:
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._execute_point(conn, point)
+                    conn.execute(
+                        "UPDATE destruction_points SET state='destroyed', attempts=attempts+1, last_error=NULL, executed_at=? WHERE id=?",
+                        (now(), point["id"]),
+                    )
+            except Exception as exc:
+                all_destroyed = False
+                with self.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE destruction_points SET state='pending', attempts=attempts+1, last_error=? WHERE id=?",
+                        (str(exc), point["id"]),
+                    )
+                break  # 某个存储点失败后停在待处理，不再继续后续存储点
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if all_destroyed:
+                conn.execute("UPDATE destructions SET status='completed', completed_at=? WHERE id=?", (now(), destruction_id))
+                conn.execute("UPDATE archive_versions SET state='destroyed' WHERE id=?", (d["version_id"],))
+                conn.execute("UPDATE copies SET state='destroyed' WHERE version_id=?", (d["version_id"],))
+                self._audit(
+                    conn, d["archive_id"], d["applicant_id"], "destruction.completed",
+                    {"destruction_id": destruction_id, "version_id": d["version_id"]},
+                )
+            else:
+                conn.execute("UPDATE destructions SET status='partial' WHERE id=?", (destruction_id,))
+                self._audit(
+                    conn, d["archive_id"], d["applicant_id"], "destruction.partial",
+                    {"destruction_id": destruction_id, "version_id": d["version_id"]},
+                )
+        return all_destroyed
+
+    def reconcile_destruction(self, actor_id: str, destruction_id: int) -> dict:
+        """恢复/对账：只重试仍处于待处理的未完成副本，已销毁的存储点不重复执行。"""
+        with self._write_lock:
+            with self.connect() as conn:
+                actor = self._user(conn, actor_id, {"owner", "archivist"})
+                d = conn.execute("SELECT * FROM destructions WHERE id=?", (destruction_id,)).fetchone()
+                if not d:
+                    raise BusinessError("销毁单不存在", 404, "not_found")
+                self._access(conn, d["archive_id"], actor, require_write=True)
+            self._run_destruction_points(destruction_id)
+            with self.connect() as conn:
+                d = conn.execute("SELECT * FROM destructions WHERE id=?", (destruction_id,)).fetchone()
+                return self._destruction_detail(conn, d)
+
+    def get_destruction(self, user_id: str, destruction_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            d = conn.execute("SELECT * FROM destructions WHERE id=?", (destruction_id,)).fetchone()
+            if not d:
+                raise BusinessError("销毁单不存在", 404, "not_found")
+            self._access(conn, d["archive_id"], user)
+            return self._destruction_detail(conn, d)
+
+    def _destruction_detail(self, conn, d: sqlite3.Row) -> dict:
+        points = conn.execute(
+            """SELECT dp.*, d.version_id FROM destruction_points dp
+               JOIN destructions d ON d.id=dp.destruction_id
+               WHERE dp.destruction_id=? ORDER BY dp.id""",
+            (d["id"],),
+        ).fetchall()
+        point_details, all_consistent = [], True
+        for p in points:
+            node_key = self._node_key(p)
+            fault = conn.execute("SELECT faulty FROM storage_faults WHERE node_key=?", (node_key,)).fetchone()
+            if p["point_kind"] == "server":
+                cnt = conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (p["version_id"],)).fetchone()[0]
+            else:
+                cnt = conn.execute("SELECT COUNT(*) FROM copy_files WHERE copy_id=?", (p["copy_id"],)).fetchone()[0]
+            actual = "gone" if cnt == 0 else "exists"
+            consistent = (p["state"] == "destroyed" and actual == "gone") or (p["state"] == "pending" and actual == "exists")
+            if not consistent:
+                all_consistent = False
+            point_details.append({
+                "id": p["id"], "node_key": node_key, "location": p["location"],
+                "state": p["state"], "attempts": p["attempts"], "last_error": p["last_error"],
+                "executed_at": p["executed_at"], "actual": actual, "consistent": consistent,
+                "faulty": bool(fault["faulty"]) if fault else False,
+            })
+        return {
+            "destruction": dict(d),
+            "points": point_details,
+            "all_consistent": all_consistent,
+            "reconciled_at": now(),
+        }
+
+    def list_destructions(self, user_id: str, archive_id: int | None = None) -> list[dict]:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            if archive_id is not None:
+                self._access(conn, archive_id, user)
+                rows = conn.execute("SELECT * FROM destructions WHERE archive_id=? ORDER BY id DESC", (archive_id,)).fetchall()
+            else:
+                rows = [r for r in conn.execute("SELECT * FROM destructions ORDER BY id DESC").fetchall()
+                        if self._can_access(conn, r["archive_id"], user)]
+            result = []
+            for r in rows:
+                summary = {
+                    row["state"]: row["c"]
+                    for row in conn.execute(
+                        "SELECT state,COUNT(*) c FROM destruction_points WHERE destruction_id=? GROUP BY state", (r["id"],)
+                    ).fetchall()
+                }
+                result.append({"destruction": dict(r), "point_summary": summary})
+            return result
+
+    def set_storage_fault(self, actor_id: str, node_key: str, faulty: bool) -> dict:
+        """注入/解除存储点介质故障，用于演示“失败后停在待处理、恢复时只重试未完成副本”。"""
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            archive_id = None
+            if node_key == "server":
+                pass
+            elif node_key.startswith("copy:"):
+                try:
+                    copy_id = int(node_key.split(":", 1)[1])
+                except ValueError:
+                    raise BusinessError("node_key 格式应为 server 或 copy:<id>", 422, "invalid_node")
+                row = conn.execute(
+                    "SELECT v.archive_id FROM copies c JOIN archive_versions v ON v.id=c.version_id WHERE c.id=?",
+                    (copy_id,),
+                ).fetchone()
+                if not row:
+                    raise BusinessError("副本不存在", 404, "not_found")
+                archive_id = row["archive_id"]
+                self._access(conn, archive_id, actor, require_write=True)
+            else:
+                raise BusinessError("node_key 必须是 server 或 copy:<id>", 422, "invalid_node")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """INSERT INTO storage_faults(node_key,faulty,updated_at) VALUES(?,?,?)
+                       ON CONFLICT(node_key) DO UPDATE SET faulty=excluded.faulty, updated_at=excluded.updated_at""",
+                    (node_key, int(bool(faulty)), now()),
+                )
+                if archive_id is not None:
+                    self._audit(conn, archive_id, actor_id, "storage.fault", {"node_key": node_key, "faulty": bool(faulty)})
+            except Exception:
+                conn.rollback()
+                raise
+            return {"node_key": node_key, "faulty": bool(faulty)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Preservation/1.0"
 
@@ -470,6 +733,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _query_params(self) -> dict:
+        from urllib.parse import parse_qs
+        return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
 
     def _dispatch(self, method: str) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
@@ -512,6 +779,19 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
+        if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "destructions" and method == "POST":
+            return self._send(201, store.request_destruction(user, int(parts[2])))
+        if parts == ["api", "destructions"] and method == "GET":
+            q = self._query_params()
+            archive_id = int(q["archive_id"]) if "archive_id" in q else None
+            return self._send(200, store.list_destructions(user, archive_id))
+        if len(parts) == 3 and parts[:2] == ["api", "destructions"] and method == "GET":
+            return self._send(200, store.get_destruction(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "destructions"] and parts[3] == "reconcile" and method == "POST":
+            return self._send(200, store.reconcile_destruction(user, int(parts[2])))
+        if parts == ["api", "storage", "fault"] and method == "POST":
+            d = self._body()
+            return self._send(200, store.set_storage_fault(user, d.get("node_key", ""), bool(d.get("faulty", True))))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method: str) -> None:

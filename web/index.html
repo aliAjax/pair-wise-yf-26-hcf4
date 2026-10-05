@@ -3,5 +3,19 @@
 <body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
 <section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
 <button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
+<section class="panel"><h2>销毁申请与账目对账</h2>
+<p>三个存储点（服务端 + 两个离线副本）一起进入待销毁，逐点执行；失败停在待处理，恢复时只重试未完成的副本，已成功的存储点不重复执行。</p>
+<label>版本 ID <input id="vid" value="1" style="width:80px"></label>
+<button onclick="requestDestruction()">申请销毁</button>
+<label>销毁单 ID <input id="did" value="1" style="width:80px"></label>
+<button onclick="loadDestruction()">查询销毁账目</button>
+<button onclick="reconcile()">对账 / 恢复</button>
+<p>介质故障注入（node_key 如 <code>copy:1</code>，解除故障用 false）：<input id="fnode" value="copy:1" style="width:100px"><button onclick="setFault(true)">注入故障</button><button onclick="setFault(false)">解除故障</button></p>
+<pre id="dout"></pre></section>
 <p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<script>const out=document.querySelector("#out"),dout=document.querySelector("#dout"),user=document.querySelector("#user");
+async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}
+async function requestDestruction(){const id=document.querySelector("#vid").value;const r=await fetch(`/api/versions/${id}/destructions`,{method:"POST",headers:{"X-User-Id":user.value}});dout.textContent=JSON.stringify(await r.json(),null,2)}
+async function loadDestruction(){const id=document.querySelector("#did").value;const r=await fetch(`/api/destructions/${id}`,{headers:{"X-User-Id":user.value}});dout.textContent=JSON.stringify(await r.json(),null,2)}
+async function reconcile(){const id=document.querySelector("#did").value;const r=await fetch(`/api/destructions/${id}/reconcile`,{method:"POST",headers:{"X-User-Id":user.value}});dout.textContent=JSON.stringify(await r.json(),null,2)}
+async function setFault(on){const node=document.querySelector("#fnode").value;const r=await fetch(`/api/storage/fault`,{method:"POST",headers:{"X-User-Id":user.value,"Content-Type":"application/json"},body:JSON.stringify({node_key:node,faulty:on})});dout.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
